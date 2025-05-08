@@ -1,4 +1,4 @@
-# 🚀 Go API Proxy with Caching, Logging, and Browser Checks
+# 🚀 Go Go Proxy | API Proxy with Caching, Logging, and Browser Checks
 
 A secure, rate-limited, and cache-aware HTTP reverse proxy for APIs, written in Go. Supports Redis caching, advanced access control (API keys, origin/browsers checks), and pluggable logging.
 
