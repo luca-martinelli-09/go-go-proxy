@@ -1,0 +1,31 @@
+services:
+  proxyapp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    env_file:
+      - .env
+    ports:
+      - "${SERVER_PORT:-8080}:${SERVER_PORT:-8080}"
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - redis
+    networks:
+      - proxy-network
+
+  redis:
+    image: "redis:7.4-alpine"
+    container_name: go_proxy_redis
+    restart: unless-stopped
+    volumes:
+      - ./tmp/redis:/data
+    networks:
+      - proxy-network
+    command: redis-server --appendonly yes --requirepass "${REDIS_PASSWORD}"
+
+networks:
+  proxy-network:
+    driver: bridge
