@@ -90,7 +90,22 @@ TIMEOUT_SECONDS=30
 
 ## Usage
 
-### 🚦 Start with Docker Compose (recommended)
+### 🐳 Run with Docker Hub Image
+
+You can run `Go Go Proxy` without building from source, using the official image:
+
+```bash
+docker run --rm \
+    -p 8080:8080 \
+    -v $PWD/.env:/app/.env \
+    -v $PWD/logs:/app/logs \
+    lucamartinelli9/go-go-proxy
+```
+
+- Make sure to have your `.env` file in the current directory with all required keys.
+- The `logs` directory will be created if it doesn't exist, and log files are rotated in there.
+
+### 🚦 Or Start with Docker Compose (recommended for production/dev)
 
 ```bash
 docker-compose up --build
@@ -117,7 +132,7 @@ go build -o proxy-server .
 **Endpoint:** `POST/GET /proxy?url=<target_api_url>`
 
 **Mandatory Headers:**
-  - `X-Api-Key-Name: <your_api_key_name>`
+  - `X-Proxy-Api-Key-Name: <your_api_key_name>`
 
 **Optional headers for advanced features:**
   - `X-Proxy-Authorization: Bearer <jwt>` &mdash; for JWT-authenticated endpoints (enabled with `JWT_SECRET`)
@@ -259,3 +274,12 @@ MIT
 ---
 
 **Happy proxying!** 🚀
+```
+
+---
+
+You may want to add the Docker Hub badge or link at the top as well:
+
+```
+[![Docker Hub](https://img.shields.io/docker/pulls/lucamartinelli9/go-go-proxy.svg)](https://hub.docker.com/r/lucamartinelli9/go-go-proxy)
+```
