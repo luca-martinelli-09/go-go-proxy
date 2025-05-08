@@ -1,5 +1,7 @@
 # 🚀 Go Go Proxy | API Proxy with Caching, Logging, JWT Authorization, and Browser Checks
 
+[![Docker Hub](https://img.shields.io/docker/pulls/lucamartinelli9/go-go-proxy.svg)](https://hub.docker.com/r/lucamartinelli9/go-go-proxy)
+
 A secure, rate-limited, and cache-aware HTTP reverse proxy for APIs, written in Go. Supports Redis caching, advanced access control (API keys, JWT, origin/browsers checks), and pluggable logging.
 
 ---
@@ -274,12 +276,3 @@ MIT
 ---
 
 **Happy proxying!** 🚀
-```
-
----
-
-You may want to add the Docker Hub badge or link at the top as well:
-
-```
-[![Docker Hub](https://img.shields.io/docker/pulls/lucamartinelli9/go-go-proxy.svg)](https://hub.docker.com/r/lucamartinelli9/go-go-proxy)
-```
