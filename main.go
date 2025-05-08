@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/joho/godotenv"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -42,6 +44,8 @@ type Config struct {
 	LogCompress          bool
 	EnforceBrowserCheck  bool
 	StrictUserAgentCheck bool
+	JWTSecret            string
+	JWTIssuerRegex       string
 	Timeout              time.Duration
 	ReadTimeout          time.Duration
 	WriteTimeout         time.Duration
@@ -59,29 +63,33 @@ const (
 	LogWarning = "WARNING"
 	LogError   = "ERROR"
 
-	HeaderApiKeyName    = "X-Api-Key-Name"
+	HeaderApiKeyName         = "X-Proxy-Api-Key-Name"
+	HeaderProxyApiQuery      = "X-Proxy-Api-Query"
+	HeaderProxyApiHeader     = "X-Proxy-Api-Header"
+	HeaderProxyApiHeaderType = "X-Proxy-Api-Header-Type"
+	HeaderProxyUseCache      = "X-Proxy-Use-Cache"
+
 	QueryParamTargetURL = "url"
-	HeaderProxyUseCache = "X-Proxy-Use-Cache"
 )
 
 var (
-	appConfig *Config
-	rdb       *redis.Client
-	logger    *log.Logger
-	once      sync.Once
+	appConfig      *Config
+	rdb            *redis.Client
+	logger         *log.Logger
+	once           sync.Once
+	jwtIssuerRegex *regexp.Regexp
 )
 
 // logMsg logs a formatted message with a specified log level and emoji.
-// It uses the global logger if initialized, otherwise it defaults to the standard
-// log package. The message is constructed by formatting the input string with
-// the provided arguments.
+// It formats the message using the provided format string and arguments.
+// If a logger is set, it outputs the message using the logger; otherwise, it logs to the standard log.
+// The log message includes the emoji and log level for context.
 //
 // Parameters:
 //   - level: The log level (e.g., INFO, WARNING, ERROR).
-//   - emoji: An emoji symbol to be prefixed to the log message.
+//   - emoji: A contextual emoji representing the log event.
 //   - format: A format string for the log message.
-//   - args: Additional arguments to format the message string.
-
+//   - args: Additional arguments to format into the message.
 func logMsg(level, emoji string, format string, args ...interface{}) {
 	msg := fmt.Sprintf("%s %s | %s", emoji, level, fmt.Sprintf(format, args...))
 	if logger == nil {
@@ -91,14 +99,41 @@ func logMsg(level, emoji string, format string, args ...interface{}) {
 	}
 }
 
-// loadConfig initializes the application configuration based on environment
-// variables. It loads the API keys from environment variables starting with
-// API_KEY_, and sets up Redis connection details and the logger based on the
-// configuration. It also sets the allowed origins regex if specified. If Redis
-// is enabled, it sets the Redis DB number and logs the Redis connection details.
-// If API keys are not found, it logs a warning. If the allowed origins regex is
-// not set, it logs a warning. It also logs the configuration details, such as
-// the server port, Redis connection details, logger settings, and rate limits.
+func getEnv(key, fallback string) string {
+	if value, exists := os.LookupEnv(key); exists {
+		return value
+	}
+	return fallback
+}
+
+func getEnvAsInt(key string, fallback int) int {
+	if value, err := strconv.Atoi(getEnv(key, "")); err == nil {
+		return value
+	}
+	return fallback
+}
+
+func getEnvAsInt64(key string, fallback int64) int64 {
+	if value, err := strconv.ParseInt(getEnv(key, ""), 10, 64); err == nil {
+		return value
+	}
+	return fallback
+}
+
+func getEnvAsBool(key string, fallback bool) bool {
+	valStr := strings.ToLower(getEnv(key, ""))
+	if valStr == "true" || valStr == "1" {
+		return true
+	}
+	if valStr == "false" || valStr == "0" {
+		return false
+	}
+	return fallback
+}
+
+// loadConfig reads configuration from the environment and sets up the global appConfig
+// instance. It also compiles regular expressions for allowed origins and JWT issuers.
+// Environment variables can be set in a .env file in the current working directory.
 func loadConfig() {
 	if err := godotenv.Load(); err != nil {
 		log.Printf("🛑 ERROR | Failed to load .env file")
@@ -119,6 +154,8 @@ func loadConfig() {
 		LogCompress:          getEnvAsBool("LOG_COMPRESS", true),
 		EnforceBrowserCheck:  getEnvAsBool("ENFORCE_BROWSER_CHECK", false),
 		StrictUserAgentCheck: getEnvAsBool("STRICT_USER_AGENT_CHECK", true),
+		JWTSecret:            getEnv("JWT_SECRET", ""),
+		JWTIssuerRegex:       getEnv("JWT_ISSUER_REGEX", ""),
 		Timeout:              time.Duration(getEnvAsInt("TIMEOUT_SECONDS", 30)) * time.Second,
 		ReadTimeout:          time.Duration(getEnvAsInt("READ_TIMEOUT_SECONDS", 14)) * time.Second,
 		WriteTimeout:         time.Duration(getEnvAsInt("WRITE_TIMEOUT_SECONDS", 45)) * time.Second,
@@ -162,6 +199,18 @@ func loadConfig() {
 		log.Printf("⚠️ WARNING | ALLOWED_ORIGINS_REGEX not set")
 	}
 
+	// Compile JWT issuer regex ONCE at startup!
+	if appConfig.JWTIssuerRegex != "" {
+		var err error
+		jwtIssuerRegex, err = regexp.Compile(appConfig.JWTIssuerRegex)
+		if err != nil {
+			log.Printf("🛑 ERROR | Invalid JWT issuer regex: %v", err)
+			os.Exit(1)
+		} else {
+			log.Printf("⚙️ INFO | Compiled JWT issuer regex: %s", appConfig.JWTIssuerRegex)
+		}
+	}
+
 	if appConfig.EnforceBrowserCheck {
 		log.Printf("🛡️ INFO | Heuristic browser check ENABLED")
 		if appConfig.StrictUserAgentCheck {
@@ -172,44 +221,9 @@ func loadConfig() {
 	}
 }
 
-func getEnv(key, fallback string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return fallback
-}
-
-func getEnvAsInt(key string, fallback int) int {
-	if value, err := strconv.Atoi(getEnv(key, "")); err == nil {
-		return value
-	}
-	return fallback
-}
-
-func getEnvAsInt64(key string, fallback int64) int64 {
-	if value, err := strconv.ParseInt(getEnv(key, ""), 10, 64); err == nil {
-		return value
-	}
-	return fallback
-}
-
-func getEnvAsBool(key string, fallback bool) bool {
-	valStr := strings.ToLower(getEnv(key, ""))
-	if valStr == "true" || valStr == "1" {
-		return true
-	}
-	if valStr == "false" || valStr == "0" {
-		return false
-	}
-	return fallback
-}
-
-// initLogger sets up the logger and enables logging to a file.
-// It will create the log directory if it does not exist, and
-// configure the logger to rotate the log file based on the
-// configured maximum size, maximum number of backups, and
-// maximum age. It also sets up a multi-writer to log to both
-// stdout and the file.
+// initLogger sets up a logger for the application, creating the log directory if needed, and
+// sets up a lumberjack.Logger to rotate the log files. The logger is also set to output to
+// both stdout and the log file.
 func initLogger() {
 	logDir := filepath.Dir(appConfig.LogFilePath)
 	if logDir != "" && logDir != "." {
@@ -235,8 +249,8 @@ func initLogger() {
 	logMsg(LogInfo, "⚙️", "Logger initialized at path %s", appConfig.LogFilePath)
 }
 
-// initRedis initializes a Redis client connection based on the configuration.
-// It returns a non-nil error if the connection cannot be established.
+// initRedis sets up a Redis connection and pings it to test the connection.
+// If the connection cannot be established, rdb is set to nil and an error is logged.
 func initRedis() {
 	if !appConfig.RedisEnabled {
 		rdb = nil
@@ -253,11 +267,10 @@ func initRedis() {
 	}
 }
 
-// getClientIP returns the client's IP address as a string.
-//
-// First, it tries to get the IP from the X-Forwarded-For header. If the header is not present,
-// it tries to get the IP from the X-Real-IP header. If both headers are not present, it falls
-// back to the RemoteAddr field of the http.Request.
+// getClientIP extracts the client's IP address from the HTTP request.
+// It first checks the "X-Forwarded-For" header for an IP list, returning the first IP.
+// If not present, it looks for the "X-Real-IP" header.
+// If both headers are absent or empty, it falls back to using the remote address from the request.
 func getClientIP(r *http.Request) string {
 	ip := r.Header.Get("X-Forwarded-For")
 	if ip != "" {
@@ -292,10 +305,9 @@ func (lrw *loggingResponseWriter) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// loggingMiddleware is a middleware function that logs the start and end of every
-// request, along with important request metadata such as the target URL, API
-// key name, and use cache header. The log messages are formatted as
-// "REQ_INIT" and "REQ_DONE" respectively, with fields separated by '|'.
+// loggingMiddleware logs the start and end of each request, including the client IP,
+// target URL, API key name, and other relevant details. It also logs the duration and
+// response bytes of each request. The request headers are logged as a JSON object.
 func loggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		startTime := time.Now()
@@ -320,16 +332,17 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// originValidationMiddleware is a middleware function that validates the
-// Origin header of incoming HTTP requests against a configured list of allowed
-// origins. If the Origin header is empty or does not match the allowed origins
-// regex, it logs a warning and responds with a 403 Forbidden status. If the
-// allowed origins regex is not set in the configuration, it allows all origins.
-// This middleware is useful for enforcing CORS policies by ensuring that only
-// requests from specified origins are processed by the server.
+// originValidationMiddleware checks the Origin header of the incoming request against
+// the AllowedOriginsRegex in the configuration. If the regex is not set, it allows all
+// origins. If the regex is set, it only allows requests with an Origin header that
+// matches the regex. If the Origin header is empty, it falls back to the Referer header.
+// If the request does not match the regex, it returns a 403 Forbidden response.
 func originValidationMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
+		if origin == "" {
+			origin = r.Header.Get("Referer")
+		}
 		if appConfig.AllowedOriginsRegex != nil {
 			if origin == "" || !appConfig.AllowedOriginsRegex.MatchString(origin) {
 				logMsg(LogWarning, "⚠️", "Origin not allowed: %s (ClientIP: %s)", origin, getClientIP(r))
@@ -341,17 +354,13 @@ func originValidationMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// browserCheckMiddleware is a middleware function that checks if the request is
-// likely to originate from a real web browser. It performs the following checks:
-//   - Checks if the User-Agent header is present and does not contain known bot
-//     or tool signatures.
-//   - Checks if the User-Agent header appears to be a real browser, if the
-//     `StrictUserAgentCheck` config option is enabled.
-//   - Checks if the Accept and Accept-Language headers are present.
-//   - Checks if the Sec-Fetch-Site header is present if the request has an
-//     Origin header, if the `AllowedOriginsRegex` config option is set.
-//
-// If any of the checks fail, it returns a 403 Forbidden response.
+// browserCheckMiddleware is a middleware that blocks requests from known bots and tools,
+// and also requires specific headers to be present in order to prevent abuse.
+// It is enabled by setting EnforceBrowserCheck to true in the configuration.
+// Note that this middleware does not provide any real security benefits, but can
+// help to reduce the amount of abuse and unwanted traffic.
+// It is not recommended to use this middleware in production without further
+// customization and testing.
 func browserCheckMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !appConfig.EnforceBrowserCheck {
@@ -401,12 +410,48 @@ func browserCheckMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// rateLimitingMiddleware is a middleware function that enforces a rate limit
-// based on the API key name specified in the "X-Api-Key-Name" header. It
-// increments a Redis counter for each request and checks if the counter is
-// above the configured rate limit. If it is, it returns a 429 Too Many Requests
-// response with a Retry-After header set to 60 seconds. If Redis is not
-// enabled, it will not enforce any rate limit.
+// copyHeaders copies headers from src to dst, excluding headers in the exclude list
+// (case-insensitive).
+func copyHeaders(dst, src http.Header, exclude ...string) {
+	excludeSet := make(map[string]struct{}, len(exclude))
+	for _, h := range exclude {
+		excludeSet[strings.ToLower(h)] = struct{}{}
+	}
+	for k, v := range src {
+		if _, skip := excludeSet[strings.ToLower(k)]; skip {
+			continue
+		}
+		for _, vv := range v {
+			dst.Add(k, vv)
+		}
+	}
+}
+
+// redactAPIKeyInBodyAndHeaders takes an API key, a redaction string, a byte slice for the request body,
+// and a http.Header, and returns the redacted byte slice and http.Header.
+// It replaces the API key in the body and headers with the redaction string.
+func redactAPIKeyInBodyAndHeaders(apiKey string, redaction string, body []byte, headers http.Header) ([]byte, http.Header) {
+	redacted := body
+	if len(apiKey) > 0 && len(body) > 0 && bytes.Contains(body, []byte(apiKey)) {
+		redacted = bytes.ReplaceAll(body, []byte(apiKey), []byte(redaction))
+	}
+	// Redact in headers
+	newHeaders := headers.Clone()
+	for k, vals := range newHeaders {
+		for i, val := range vals {
+			if strings.Contains(val, apiKey) {
+				newHeaders[k][i] = strings.ReplaceAll(val, apiKey, redaction)
+			}
+		}
+	}
+	return redacted, newHeaders
+}
+
+// rateLimitingMiddleware adds rate limiting to a request handler.
+// It expects a Redis client to be set up and the RateLimitPerMinute to be set.
+// It increments the rate limit counter for the API Key Name in the X-Proxy-Api-Key-Name header.
+// If the counter exceeds the rate limit, a 429 Too Many Requests response is sent.
+// If Redis is not enabled or the API Key Name is not set, the request is passed through to the wrapped handler.
 func rateLimitingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !appConfig.RedisEnabled || rdb == nil {
@@ -419,21 +464,21 @@ func rateLimitingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			next.ServeHTTP(w, r)
 			return
 		}
-		actualAPIKey, exists := appConfig.APITokens[apiKeyName]
+		_, exists := appConfig.APITokens[apiKeyName]
 		if !exists {
 			next.ServeHTTP(w, r)
 			return
 		}
-		rateLimitKey := fmt.Sprintf("ratelimit:%s", actualAPIKey)
-		ctx := context.Background()
+		rateLimitKey := fmt.Sprintf("ratelimit:%s", apiKeyName)
+		ctx := r.Context()
 		currentCount, err := rdb.Incr(ctx, rateLimitKey).Result()
 		if err != nil {
-			logMsg(LogError, "🛑", "Failed to increment rate-limit for API Key %s: %v", rateLimitKey, err)
+			logMsg(LogError, "🛑", "Failed to increment rate-limit for API Key Name %s: %v", rateLimitKey, err)
 			next.ServeHTTP(w, r)
 			return
 		}
 		if currentCount == 1 {
-			rdb.Expire(ctx, rateLimitKey, 1*time.Minute)
+			_ = rdb.Expire(ctx, rateLimitKey, 1*time.Minute)
 		}
 		if currentCount > appConfig.RateLimitPerMinute {
 			logMsg(LogWarning, "⚠️", "Rate limit exceeded for API Key Name: %s (ClientIP: %s, Count: %d)", apiKeyName, getClientIP(r), currentCount)
@@ -445,32 +490,121 @@ func rateLimitingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// proxyHandler handles incoming HTTP requests to the /proxy endpoint, forwarding
-// them to the target URL specified in the query parameters. It also manages API
-// key validation, caching, and response handling.
-//
-// It performs the following operations:
-//   - Validates the presence of the 'targetURL' query parameter and 'X-Api-Key-Name' header.
-//   - Checks if the API key is valid and exists in the configuration.
-//   - Reads the request body and constructs a cache key if caching is enabled.
-//   - Attempts to retrieve a cached response from Redis if caching is enabled and
-//     the 'X-Proxy-Use-Cache' header is set to true.
-//   - If no cached response is found, it forwards the request to the target URL,
-//     appending the API key as a query parameter.
-//   - Sets appropriate headers and status code in the response.
-//   - Caches the response in Redis if caching is enabled and the response status
-//     code is in the 2xx range.
+// jwtAuthMiddleware adds JWT authentication to a request handler.
+// It expects a JWT in the X-Proxy-Authorization header with Bearer prefix.
+// The JWT is verified with the configured JWT secret.
+// If the JWT is invalid, expired, or not yet valid, a 401 Unauthorized response is sent.
+// If the JWT is valid, the request is passed through to the wrapped handler.
+// The JWT claims are stored in the request context under the "jwt_claims" key.
+func jwtAuthMiddleware(next http.Handler) http.Handler {
+	const HeaderProxyJWT = "X-Proxy-Authorization"
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientIP := getClientIP(r)
+		if appConfig.JWTSecret == "" {
+			logMsg(LogInfo, "ℹ️", "JWT authentication is disabled (JWTSecret is empty). Passing request through.")
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		authHeader := r.Header.Get(HeaderProxyJWT)
+		const bearerPrefix = "Bearer "
+		if !strings.HasPrefix(authHeader, bearerPrefix) {
+			logMsg(LogWarning, "⚠️", "Missing or malformed JWT in %s header (ClientIP: %s)", HeaderProxyJWT, clientIP)
+			http.Error(w, "Unauthorized: JWT required in "+HeaderProxyJWT+" header", http.StatusUnauthorized)
+			return
+		}
+
+		tokenStr := strings.TrimPrefix(authHeader, bearerPrefix)
+		token, err := jwt.ParseWithClaims(tokenStr, jwt.MapClaims{}, func(token *jwt.Token) (interface{}, error) {
+			if token.Method != jwt.SigningMethodHS256 {
+				actualAlg := "unknown"
+				if algHeader, ok := token.Header["alg"].(string); ok {
+					actualAlg = algHeader
+				}
+				return nil, errors.New("unexpected signing method: expected HS256, got " + actualAlg)
+			}
+			return []byte(appConfig.JWTSecret), nil
+		})
+
+		if err != nil {
+			if errors.Is(err, jwt.ErrTokenExpired) {
+				logMsg(LogWarning, "⚠️", "JWT expired (ClientIP: %s): %v", clientIP, err)
+				http.Error(w, "Unauthorized: JWT expired", http.StatusUnauthorized)
+			} else if errors.Is(err, jwt.ErrTokenNotValidYet) {
+				logMsg(LogWarning, "⚠️", "JWT not yet valid (ClientIP: %s): %v", clientIP, err)
+				http.Error(w, "Unauthorized: JWT not yet valid", http.StatusUnauthorized)
+			} else if errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+				logMsg(LogWarning, "⚠️", "JWT signature invalid (ClientIP: %s): %v", clientIP, err)
+				http.Error(w, "Unauthorized: JWT signature invalid", http.StatusUnauthorized)
+			} else {
+				logMsg(LogWarning, "⚠️", "JWT parsing/validation error (ClientIP: %s): %v", clientIP, err)
+				http.Error(w, "Unauthorized: Invalid JWT", http.StatusUnauthorized)
+			}
+			return
+		}
+
+		if !token.Valid {
+			logMsg(LogWarning, "⚠️", "JWT token is invalid (ClientIP: %s)", clientIP)
+			http.Error(w, "Unauthorized: Invalid JWT token", http.StatusUnauthorized)
+			return
+		}
+
+		claims, ok := token.Claims.(jwt.MapClaims)
+		if !ok {
+			logMsg(LogError, "🛑", "Could not cast JWT claims to MapClaims (ClientIP: %s)", clientIP)
+			http.Error(w, "Internal Server Error: processing JWT claims", http.StatusInternalServerError)
+			return
+		}
+
+		if jwtIssuerRegex != nil {
+			issClaim, issOk := claims["iss"].(string)
+			if !issOk {
+				logMsg(LogWarning, "⚠️", "JWT 'iss' claim missing or not a string (ClientIP: %s)", clientIP)
+				http.Error(w, "Unauthorized: JWT 'iss' claim invalid", http.StatusUnauthorized)
+				return
+			}
+
+			if !jwtIssuerRegex.MatchString(issClaim) {
+				logMsg(LogWarning, "⚠️", "JWT 'iss' claim '%s' does not match configured regex (ClientIP: %s)", issClaim, clientIP)
+				http.Error(w, "Unauthorized: JWT issuer not permitted", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		subClaim, subOk := claims["sub"].(string)
+		if !subOk || subClaim == "" {
+			logMsg(LogWarning, "⚠️", "JWT 'sub' claim missing, not a string, or empty (ClientIP: %s)", clientIP)
+			http.Error(w, "Unauthorized: JWT 'sub' claim invalid", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// proxyHandler is the main request handler for the proxy.
+// It expects the TargetURL parameter to be set in the query string.
+// It also expects the ApiKeyName header to be set.
+// If the request body is not empty, it's passed through to the target.
+// If the HeaderProxyUseCache header is set to "true", it will cache the response
+// in Redis for CacheTTL seconds. The cache key is a SHA-256 hash of the request
+// method, target URL, request body, and API key name.
+// If the HeaderProxyApiQuery parameter is set, it will pass the API key as a query
+// parameter with that name instead of using the Authorization header.
+// If the HeaderProxyApiHeader parameter is set, it will pass the API key as a
+// header with that name instead of using the Authorization header.
+// If the HeaderProxyApiHeaderType parameter is set, it will use that type
+// instead of "Bearer" for the API key header.
+// The TargetURL parameter is not validated, so be careful when using this.
+// The API key is redacted from the response body and headers before being
+// sent to the client.
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	targetURLStr := r.URL.Query().Get(QueryParamTargetURL)
 	apiKeyName := r.Header.Get(HeaderApiKeyName)
 	requestMethod := r.Method
 	useCacheHeaderValue := strings.ToLower(r.Header.Get(HeaderProxyUseCache))
-
-	shouldUseCacheFromHeader := true
-	if useCacheHeaderValue == "false" {
-		shouldUseCacheFromHeader = false
-		logMsg(LogInfo, "🧩", "Cache disabled by %s header", HeaderProxyUseCache)
-	}
+	shouldUseCacheFromHeader := useCacheHeaderValue != "false"
 
 	if targetURLStr == "" {
 		http.Error(w, fmt.Sprintf("Missing required query param '%s'", QueryParamTargetURL), http.StatusBadRequest)
@@ -490,15 +624,16 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestBodyBytes, err := io.ReadAll(r.Body)
+	r.Body.Close()
 	if err != nil {
 		logMsg(LogError, "🛑", "Failed to read request body: %v", err)
 		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
-	defer r.Body.Close()
 
 	cacheKey := ""
-	ctx := context.Background()
+	ctx := r.Context()
+	redactionString := "***"
 
 	if shouldUseCacheFromHeader && appConfig.RedisEnabled && rdb != nil && appConfig.CacheTTL > 0 {
 		hash := sha256.New()
@@ -515,17 +650,11 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			var cachedResp CachedResponse
 			if err := json.Unmarshal([]byte(cachedVal), &cachedResp); err == nil {
 				logMsg(LogInfo, "💾", "Cache hit (Redis) for %s %s (API Key Name: %s, CacheKey: %s)", requestMethod, targetURLStr, apiKeyName, cacheKey)
-				for key, values := range cachedResp.Headers {
-					lowerKey := strings.ToLower(key)
-					if lowerKey == "content-length" || lowerKey == "connection" || lowerKey == "transfer-encoding" || lowerKey == "keep-alive" {
-						continue
-					}
-					for _, value := range values {
-						w.Header().Add(key, value)
-					}
-				}
+				copyHeaders(w.Header(), http.Header(cachedResp.Headers), "content-length", "connection", "transfer-encoding", "keep-alive")
 				w.WriteHeader(cachedResp.StatusCode)
-				w.Write(cachedResp.Body)
+				if _, err := w.Write(cachedResp.Body); err != nil {
+					logMsg(LogError, "🛑", "Error writing cached response: %v", err)
+				}
 				return
 			}
 			logMsg(LogError, "🛑", "Failed to unmarshal cache for %s: %v", cacheKey, err)
@@ -534,8 +663,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		} else {
 			logMsg(LogInfo, "📭", "Cache miss (Redis) for %s %s (API Key Name: %s, CacheKey: %s)", requestMethod, targetURLStr, apiKeyName, cacheKey)
 		}
-	} else if appConfig.RedisEnabled && rdb != nil && appConfig.CacheTTL > 0 && !shouldUseCacheFromHeader {
-		logMsg(LogInfo, "🧩", "Cache is disabled by header (%s) for %s %s", HeaderProxyUseCache, requestMethod, targetURLStr)
 	}
 
 	parsedTargetURL, err := url.Parse(targetURLStr)
@@ -544,10 +671,20 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := parsedTargetURL.Query()
-	query.Set("key", actualAPIKey)
-	parsedTargetURL.RawQuery = query.Encode()
+	proxyApiQueryParam := r.Header.Get(HeaderProxyApiQuery)
+	proxyApiHeaderName := r.Header.Get(HeaderProxyApiHeader)
+	proxyApiHeaderType := r.Header.Get(HeaderProxyApiHeaderType)
+	if proxyApiHeaderType == "" {
+		proxyApiHeaderType = "Bearer"
+	}
+
 	finalTargetURL := parsedTargetURL.String()
+	if proxyApiQueryParam != "" {
+		q := parsedTargetURL.Query()
+		q.Set(proxyApiQueryParam, actualAPIKey)
+		parsedTargetURL.RawQuery = q.Encode()
+		finalTargetURL = parsedTargetURL.String()
+	}
 
 	var reqBodyReader io.Reader
 	if len(requestBodyBytes) > 0 {
@@ -561,25 +698,18 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for k, v := range r.Header {
-		lowerK := strings.ToLower(k)
-		if lowerK == strings.ToLower(HeaderApiKeyName) ||
-			lowerK == strings.ToLower(HeaderProxyUseCache) ||
-			lowerK == "connection" ||
-			lowerK == "proxy-connection" ||
-			lowerK == "proxy-authenticate" ||
-			lowerK == "proxy-authorization" ||
-			lowerK == "te" ||
-			lowerK == "trailers" ||
-			lowerK == "transfer-encoding" ||
-			lowerK == "upgrade" {
-			continue
-		}
-		if len(v) > 0 {
-			outReq.Header.Set(k, v[0])
-		}
+	outReq = outReq.WithContext(ctx)
+	copyHeaders(outReq.Header, r.Header, HeaderApiKeyName, HeaderProxyUseCache,
+		HeaderProxyApiQuery, HeaderProxyApiHeader, HeaderProxyApiHeaderType,
+		"connection", "proxy-connection", "proxy-authenticate", "proxy-authorization", "te",
+		"trailers", "transfer-encoding", "upgrade")
+
+	if proxyApiHeaderName != "" {
+		outReq.Header.Set(proxyApiHeaderName, fmt.Sprintf("%s %s", proxyApiHeaderType, actualAPIKey))
+	} else if proxyApiQueryParam == "" {
+		outReq.Header.Set("Authorization", "Bearer "+actualAPIKey)
 	}
-	outReq.Header.Set("Authorization", actualAPIKey)
+
 	if outReq.Header.Get("Host") == "" && parsedTargetURL.Host != "" {
 		outReq.Host = parsedTargetURL.Host
 	}
@@ -600,16 +730,8 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for key, values := range resp.Header {
-		lowerKey := strings.ToLower(key)
-		if lowerKey == "connection" || lowerKey == "content-length" ||
-			lowerKey == "transfer-encoding" || lowerKey == "keep-alive" {
-			continue
-		}
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	respBody, resp.Header = redactAPIKeyInBodyAndHeaders(actualAPIKey, redactionString, respBody, resp.Header)
+	copyHeaders(w.Header(), resp.Header, "connection", "content-length", "transfer-encoding", "keep-alive")
 
 	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
 		w.Header().Set("Content-Type", contentType)
@@ -619,9 +741,10 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		}
 	}
-
 	w.WriteHeader(resp.StatusCode)
-	w.Write(respBody)
+	if _, err := w.Write(respBody); err != nil {
+		logMsg(LogError, "🛑", "Error writing response body: %v", err)
+	}
 
 	if shouldUseCacheFromHeader && appConfig.RedisEnabled && rdb != nil && appConfig.CacheTTL > 0 && cacheKey != "" && resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		responseToCache := CachedResponse{
@@ -640,16 +763,13 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 				logMsg(LogInfo, "📝", "Set cache for %s %s (API Key Name: %s, CacheKey: %s) with TTL %s", requestMethod, targetURLStr, apiKeyName, cacheKey, appConfig.CacheTTL)
 			}
 		}
-	} else if appConfig.RedisEnabled && rdb != nil && appConfig.CacheTTL > 0 && cacheKey != "" && !shouldUseCacheFromHeader {
-		logMsg(LogInfo, "🧩", "Cache intentionally ignored due to %s header set to false for %s %s", HeaderProxyUseCache, requestMethod, targetURLStr)
 	}
 }
 
-// main initializes the application configuration, sets up the logger and Redis
-// connection if enabled, and starts the HTTP server on the configured port.
-// The server listens for incoming requests to the /proxy endpoint, and applies
-// the rate limiting, browser check, origin validation, and logging middleware
-// in sequence.
+// main initializes the application by loading configuration, setting up logging and
+// Redis, and starting an HTTP server to handle proxy requests. It sets up a chain of
+// middleware for authentication, rate limiting, browser checks, origin validation, and
+// logging. The server listens on the configured port and uses the /proxy endpoint.
 func main() {
 	once.Do(func() {
 		loadConfig()
@@ -659,6 +779,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	var currentHandler http.Handler = http.HandlerFunc(proxyHandler)
+	currentHandler = jwtAuthMiddleware(currentHandler)
 	currentHandler = rateLimitingMiddleware(http.HandlerFunc(currentHandler.(http.HandlerFunc)))
 	if appConfig.EnforceBrowserCheck {
 		currentHandler = browserCheckMiddleware(currentHandler)
