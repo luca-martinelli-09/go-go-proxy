@@ -141,8 +141,8 @@ go build -o proxy-server .
   - `X-Proxy-Use-Cache: false` &mdash; disables cache for this request
   - `X-Proxy-Api-Query: <queryparam>` &mdash; **places API key as query parameter** (`?{queryparam}=your_key`)
   - `X-Proxy-Api-Header: <header_name>` &mdash; **places API key as a custom request header**
-      - By default, will use value: `Bearer <key>`
-  - `X-Proxy-Api-Header-Type: <prefix>` &mdash; (default `Bearer`) override value prefix; e.g., `Token <key>` or just key.
+      - By default, will use value: `Authorization`
+  - `X-Proxy-Api-Header-Type: <prefix>` &mdash; (default void) set a value prefix; e.g., `Bearer <key>`, `Token <key>` or just key.
 
 **Examples:**
 

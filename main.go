@@ -674,9 +674,6 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	proxyApiQueryParam := r.Header.Get(HeaderProxyApiQuery)
 	proxyApiHeaderName := r.Header.Get(HeaderProxyApiHeader)
 	proxyApiHeaderType := r.Header.Get(HeaderProxyApiHeaderType)
-	if proxyApiHeaderType == "" {
-		proxyApiHeaderType = "Bearer"
-	}
 
 	finalTargetURL := parsedTargetURL.String()
 	if proxyApiQueryParam != "" {
