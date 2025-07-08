@@ -27,6 +27,11 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// normalizeAPIKeyName formats the API key name for consistent lookup: uppercase and replace '-' with '_'
+func normalizeAPIKeyName(name string) string {
+	return strings.ToUpper(strings.ReplaceAll(name, "-", "_"))
+}
+
 type Config struct {
 	ServerPort           string
 	APITokens            map[string]string
@@ -178,7 +183,8 @@ func loadConfig() {
 		pair := strings.SplitN(e, "=", 2)
 		if strings.HasPrefix(pair[0], "API_KEY_") {
 			keyName := strings.TrimPrefix(pair[0], "API_KEY_")
-			appConfig.APITokens[keyName] = pair[1]
+			normalizedKeyName := normalizeAPIKeyName(keyName)
+			appConfig.APITokens[normalizedKeyName] = pair[1]
 			log.Printf("🔑 INFO | Loaded API key for %s", keyName)
 		}
 	}
@@ -367,36 +373,48 @@ func originValidationMiddleware(next http.Handler) http.Handler {
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
+		apiKeyName := r.Header.Get(HeaderApiKeyName)
+		logMsg(LogInfo, "🌐", "CORS start | Origin: %s | APIKeyName: %s", origin, apiKeyName)
 
 		// 1) Service-specific: ALLOWED_ORIGINS_<API_KEY_NAME>
 		allowedEnv := ""
-		if apiKeyName := r.Header.Get(HeaderApiKeyName); apiKeyName != "" {
-			svcKey := strings.ToUpper(strings.ReplaceAll(apiKeyName, "-", "_"))
+		if apiKeyName != "" {
+			svcKey := normalizeAPIKeyName(apiKeyName)
 			allowedEnv = os.Getenv("ALLOWED_ORIGINS_" + svcKey)
+			logMsg(LogInfo, "🔑", "CORS service-specific var ALLOWED_ORIGINS_%s=%s", svcKey, allowedEnv)
 		}
 
 		// 2) Global fallback: ALLOWED_ORIGINS
 		if allowedEnv == "" {
 			allowedEnv = os.Getenv("ALLOWED_ORIGINS")
+			logMsg(LogInfo, "🌍", "CORS global var ALLOWED_ORIGINS=%s", allowedEnv)
 		}
 
 		// 3) Final fallback to wildcard
 		if allowedEnv == "" {
 			allowedEnv = "*"
+			logMsg(LogInfo, "🌍", "CORS fallback to wildcard '*' allowedEnv")
 		}
 
 		// Set Access-Control-Allow-Origin
 		if allowedEnv == "*" {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
+			logMsg(LogInfo, "✅", "CORS allow all origins (*)")
 		} else if origin != "" {
+			matched := false
 			if u, err := url.Parse(origin); err == nil {
 				originHost := u.Hostname()
 				for _, o := range strings.Split(allowedEnv, ",") {
 					if strings.TrimSpace(o) == originHost {
 						w.Header().Set("Access-Control-Allow-Origin", origin)
+						matched = true
+						logMsg(LogInfo, "✅", "CORS origin allowed: %s (host %s) in %s", origin, originHost, allowedEnv)
 						break
 					}
 				}
+			}
+			if !matched {
+				logMsg(LogWarning, "⚠️", "CORS origin denied: %s not in allowed list %s", origin, allowedEnv)
 			}
 		}
 
@@ -515,18 +533,19 @@ func rateLimitingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			next.ServeHTTP(w, r)
 			return
 		}
-		apiKeyName := r.Header.Get(HeaderApiKeyName)
-		if apiKeyName == "" {
+		apiKeyNameRaw := r.Header.Get(HeaderApiKeyName)
+		if apiKeyNameRaw == "" {
 			logMsg(LogWarning, "⚠️", "Missing %s header (ClientIP: %s)", HeaderApiKeyName, getClientIP(r))
 			next.ServeHTTP(w, r)
 			return
 		}
-		_, exists := appConfig.APITokens[apiKeyName]
+		normalizedKeyName := normalizeAPIKeyName(apiKeyNameRaw)
+		_, exists := appConfig.APITokens[normalizedKeyName]
 		if !exists {
 			next.ServeHTTP(w, r)
 			return
 		}
-		rateLimitKey := fmt.Sprintf("ratelimit:%s", apiKeyName)
+		rateLimitKey := fmt.Sprintf("ratelimit:%s", normalizedKeyName)
 		ctx := r.Context()
 		currentCount, err := rdb.Incr(ctx, rateLimitKey).Result()
 		if err != nil {
@@ -538,7 +557,7 @@ func rateLimitingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 			_ = rdb.Expire(ctx, rateLimitKey, 1*time.Minute)
 		}
 		if currentCount > appConfig.RateLimitPerMinute {
-			logMsg(LogWarning, "⚠️", "Rate limit exceeded for API Key Name: %s (ClientIP: %s, Count: %d)", apiKeyName, getClientIP(r), currentCount)
+			logMsg(LogWarning, "⚠️", "Rate limit exceeded for API Key Name: %s (ClientIP: %s, Count: %d)", apiKeyNameRaw, getClientIP(r), currentCount)
 			w.Header().Set("Retry-After", "60")
 			http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 			return
@@ -658,7 +677,8 @@ func jwtAuthMiddleware(next http.Handler) http.Handler {
 // sent to the client.
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	targetURLStr := r.URL.Query().Get(QueryParamTargetURL)
-	apiKeyName := r.Header.Get(HeaderApiKeyName)
+	apiKeyNameRaw := r.Header.Get(HeaderApiKeyName)
+	normalizedKeyName := normalizeAPIKeyName(apiKeyNameRaw)
 	requestMethod := r.Method
 	useCacheHeaderValue := strings.ToLower(r.Header.Get(HeaderProxyUseCache))
 	shouldUseCacheFromHeader := useCacheHeaderValue != "false"
@@ -668,14 +688,14 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if apiKeyName == "" {
+	if apiKeyNameRaw == "" {
 		http.Error(w, fmt.Sprintf("Missing required header '%s'", HeaderApiKeyName), http.StatusBadRequest)
 		return
 	}
 
-	actualAPIKey, apiKeyExists := appConfig.APITokens[apiKeyName]
+	actualAPIKey, apiKeyExists := appConfig.APITokens[normalizedKeyName]
 	if !apiKeyExists {
-		logMsg(LogWarning, "⚠️", "Invalid API Key Name: %s (ClientIP: %s)", apiKeyName, getClientIP(r))
+		logMsg(LogWarning, "⚠️", "Invalid API Key Name: %s (ClientIP: %s)", apiKeyNameRaw, getClientIP(r))
 		http.Error(w, "API Key Name not found", http.StatusUnauthorized)
 		return
 	}
@@ -699,14 +719,14 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		if len(requestBodyBytes) > 0 {
 			hash.Write(requestBodyBytes)
 		}
-		hash.Write([]byte(apiKeyName))
+		hash.Write([]byte(normalizedKeyName))
 		cacheKey = fmt.Sprintf("cache:%s", hex.EncodeToString(hash.Sum(nil)))
 
 		cachedVal, err := rdb.Get(ctx, cacheKey).Result()
 		if err == nil {
 			var cachedResp CachedResponse
 			if err := json.Unmarshal([]byte(cachedVal), &cachedResp); err == nil {
-				logMsg(LogInfo, "💾", "Cache hit (Redis) for %s %s (API Key Name: %s, CacheKey: %s)", requestMethod, targetURLStr, apiKeyName, cacheKey)
+				logMsg(LogInfo, "💾", "Cache hit (Redis) for %s %s (API Key Name: %s, CacheKey: %s)", requestMethod, targetURLStr, apiKeyNameRaw, cacheKey)
 				copyHeaders(w.Header(), http.Header(cachedResp.Headers), "content-length", "connection", "transfer-encoding", "keep-alive", "access-control-allow-origin", "access-control-allow-methods", "access-control-allow-headers", "access-control-expose-headers", "access-control-allow-credentials", "access-control-max-age")
 				w.WriteHeader(cachedResp.StatusCode)
 				if _, err := w.Write(cachedResp.Body); err != nil {
@@ -718,7 +738,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		} else if err != redis.Nil {
 			logMsg(LogError, "🛑", "Failed to get cache from Redis for %s: %v", cacheKey, err)
 		} else {
-			logMsg(LogInfo, "📭", "Cache miss (Redis) for %s %s (API Key Name: %s, CacheKey: %s)", requestMethod, targetURLStr, apiKeyName, cacheKey)
+			logMsg(LogInfo, "📭", "Cache miss (Redis) for %s %s (API Key Name: %s, CacheKey: %s)", requestMethod, targetURLStr, apiKeyNameRaw, cacheKey)
 		}
 	}
 
@@ -814,7 +834,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				logMsg(LogError, "🛑", "Failed to set cache in Redis (key: %s): %v", cacheKey, err)
 			} else {
-				logMsg(LogInfo, "📝", "Set cache for %s %s (API Key Name: %s, CacheKey: %s) with TTL %s", requestMethod, targetURLStr, apiKeyName, cacheKey, appConfig.CacheTTL)
+				logMsg(LogInfo, "📝", "Set cache for %s %s (API Key Name: %s, CacheKey: %s) with TTL %s", requestMethod, targetURLStr, apiKeyNameRaw, cacheKey, appConfig.CacheTTL)
 			}
 		}
 	}
