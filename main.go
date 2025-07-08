@@ -361,6 +361,58 @@ func originValidationMiddleware(next http.Handler) http.Handler {
 // help to reduce the amount of abuse and unwanted traffic.
 // It is not recommended to use this middleware in production without further
 // customization and testing.
+// corsMiddleware sets Access-Control headers using service-specific or global env vars.
+// It derives a per-service list from ALLOWED_ORIGINS_<API_KEY_NAME>, falling back to ALLOWED_ORIGINS or '*'.
+// It matches against the Hostname of the Origin header and echoes back the full Origin if allowed.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+
+		// 1) Service-specific: ALLOWED_ORIGINS_<API_KEY_NAME>
+		allowedEnv := ""
+		if apiKeyName := r.Header.Get(HeaderApiKeyName); apiKeyName != "" {
+			svcKey := strings.ToUpper(strings.ReplaceAll(apiKeyName, "-", "_"))
+			allowedEnv = os.Getenv("ALLOWED_ORIGINS_" + svcKey)
+		}
+
+		// 2) Global fallback: ALLOWED_ORIGINS
+		if allowedEnv == "" {
+			allowedEnv = os.Getenv("ALLOWED_ORIGINS")
+		}
+
+		// 3) Final fallback to wildcard
+		if allowedEnv == "" {
+			allowedEnv = "*"
+		}
+
+		// Set Access-Control-Allow-Origin
+		if allowedEnv == "*" {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else if origin != "" {
+			if u, err := url.Parse(origin); err == nil {
+				originHost := u.Hostname()
+				for _, o := range strings.Split(allowedEnv, ",") {
+					if strings.TrimSpace(o) == originHost {
+						w.Header().Set("Access-Control-Allow-Origin", origin)
+						break
+					}
+				}
+			}
+		}
+
+		// Standard CORS headers
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+
+		// Handle preflight
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func browserCheckMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !appConfig.EnforceBrowserCheck {
@@ -418,7 +470,12 @@ func copyHeaders(dst, src http.Header, exclude ...string) {
 		excludeSet[strings.ToLower(h)] = struct{}{}
 	}
 	for k, v := range src {
-		if _, skip := excludeSet[strings.ToLower(k)]; skip {
+		lowerKey := strings.ToLower(k)
+		// Skip any CORS headers to avoid duplicates
+		if strings.HasPrefix(lowerKey, "access-control-") {
+			continue
+		}
+		if _, skip := excludeSet[lowerKey]; skip {
 			continue
 		}
 		for _, vv := range v {
@@ -650,7 +707,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 			var cachedResp CachedResponse
 			if err := json.Unmarshal([]byte(cachedVal), &cachedResp); err == nil {
 				logMsg(LogInfo, "💾", "Cache hit (Redis) for %s %s (API Key Name: %s, CacheKey: %s)", requestMethod, targetURLStr, apiKeyName, cacheKey)
-				copyHeaders(w.Header(), http.Header(cachedResp.Headers), "content-length", "connection", "transfer-encoding", "keep-alive")
+				copyHeaders(w.Header(), http.Header(cachedResp.Headers), "content-length", "connection", "transfer-encoding", "keep-alive", "access-control-allow-origin", "access-control-allow-methods", "access-control-allow-headers", "access-control-expose-headers", "access-control-allow-credentials", "access-control-max-age")
 				w.WriteHeader(cachedResp.StatusCode)
 				if _, err := w.Write(cachedResp.Body); err != nil {
 					logMsg(LogError, "🛑", "Error writing cached response: %v", err)
@@ -728,7 +785,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respBody, resp.Header = redactAPIKeyInBodyAndHeaders(actualAPIKey, redactionString, respBody, resp.Header)
-	copyHeaders(w.Header(), resp.Header, "connection", "content-length", "transfer-encoding", "keep-alive")
+	copyHeaders(w.Header(), resp.Header, "connection", "content-length", "transfer-encoding", "keep-alive", "access-control-allow-origin", "access-control-allow-methods", "access-control-allow-headers", "access-control-expose-headers", "access-control-allow-credentials", "access-control-max-age")
 
 	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
 		w.Header().Set("Content-Type", contentType)
@@ -783,6 +840,7 @@ func main() {
 	}
 	currentHandler = originValidationMiddleware(currentHandler)
 	currentHandler = loggingMiddleware(currentHandler)
+	currentHandler = corsMiddleware(currentHandler)
 	mux.Handle("/proxy", currentHandler)
 
 	logMsg(LogInfo, "🚀", "Application started on port %s. Endpoint: /proxy", appConfig.ServerPort)

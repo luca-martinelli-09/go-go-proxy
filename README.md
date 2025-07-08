@@ -22,22 +22,22 @@ A secure, rate-limited, and cache-aware HTTP reverse proxy for APIs, written in 
 
 ## How it Works
 
-1. **Incoming Client Request:**  
-   - Client sends `/proxy?url=<target_url>` with a `X-Api-Key-Name` header (and optionally custom API-key-placement headers).
-2. **(Optional) JWT Authorization:**  
+1. **Incoming Client Request:**
+   - Client sends `/proxy?url=<target_url>` with a `X-Proxy-Api-Key-Name` header (and optionally custom API-key-placement headers).
+2. **(Optional) JWT Authorization:**
    - If enabled, requests must supply a signed JWT in the `X-Proxy-Authorization` header.
-3. **Origin & Browser Checks:**  
+3. **Origin & Browser Checks:**
    - Origin header gets validated against a regex.
    - Optionally, browser headers are checked (e.g., User-Agent).
-4. **Rate Limiting (Redis):**  
+4. **Rate Limiting (Redis):**
    - Each API key is ratelimited using Redis; abusive IPs get `429 Too Many Requests`.
-5. **Caching (Redis):**  
+5. **Caching (Redis):**
    - For eligible requests (GET or as configured), results are cached based on method+url+body+apikey.
    - If enabled, next call will hit Redis cache (fast!)
-6. **Proxying:**  
+6. **Proxying:**
    - The original request is sent to the upstream API, passing appropriate headers and API key (as header or query).
    - The response is forwarded to the client (and optionally cached).
-7. **Logging:**  
+7. **Logging:**
    - All steps are logged with contextual emojis to both stdout and file (with rotation).
 
 ---
@@ -89,6 +89,20 @@ TIMEOUT_SECONDS=30
 ```
 
 ---
+
+## CORS Configuration
+
+You can control allowed CORS origins using environment variables:
+
+- **ALLOWED_ORIGINS**: A comma-separated list of allowed hostnames (for example: `localhost`, `example.com`). This global setting applies if no service-specific variable is provided.
+- **ALLOWED_ORIGINS_<SERVICE_HOST>**: A comma-separated list of hostnames for a specific upstream service, where `<SERVICE_HOST>` is the target hostname with dots replaced by underscores and uppercase. For example:
+  ```
+  ALLOWED_ORIGINS_COMUNE_SONA_VR_IT=localhost,comune.sona.vr.it
+  ```
+  This service-specific variable takes precedence over `ALLOWED_ORIGINS`.
+- If neither `ALLOWED_ORIGINS_<SERVICE_HOST>` nor `ALLOWED_ORIGINS` is set, the proxy will default to `*` (allow all origins).
+
+The proxy uses this configuration in its CORS middleware to set the `Access-Control-Allow-Origin` header on all `/proxy` responses.
 
 ## Usage
 
@@ -148,19 +162,19 @@ go build -o proxy-server .
 
 - _Default (API key as bearer header):_
     ```bash
-    curl -H "X-Api-Key-Name: SERVICE_A" \
+    curl -H "X-Proxy-Api-Key-Name: SERVICE_A" \
          "http://localhost:8080/proxy?url=https://api.example.com/endpoint"
     ```
 - _API key as custom query:_
     ```bash
-    curl -H "X-Api-Key-Name: SERVICE_A" \
+    curl -H "X-Proxy-Api-Key-Name: SERVICE_A" \
          -H "X-Proxy-Api-Query: apikey" \
          "http://localhost:8080/proxy?url=https://api.example.com/endpoint"
     # → results in .../endpoint?apikey=your_actual_key
     ```
 - _API key as custom header with custom prefix:_
     ```bash
-    curl -H "X-Api-Key-Name: SERVICE_B" \
+    curl -H "X-Proxy-Api-Key-Name: SERVICE_B" \
          -H "X-Proxy-Api-Header: X-My-Service-Api-Token" \
          -H "X-Proxy-Api-Header-Type: Token" \
          "http://localhost:8080/proxy?url=https://api.example.com/endpoint"
@@ -168,7 +182,7 @@ go build -o proxy-server .
     ```
 - _JWT protected usage:_
     ```bash
-    curl -H "X-Api-Key-Name: SERVICE_B" \
+    curl -H "X-Proxy-Api-Key-Name: SERVICE_B" \
          -H "X-Proxy-Authorization: Bearer <JWT>" \
          "http://localhost:8080/proxy?url=https://api.example.com/endpoint"
     # (requires valid JWT if configured)
