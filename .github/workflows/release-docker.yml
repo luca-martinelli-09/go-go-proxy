@@ -27,7 +27,13 @@ jobs:
       - name: 🗃️ Extract Docker image tag from GitHub Release
         id: vars
         run: |
-          echo "tag=${GITHUB_REF##*/}" >> "$GITHUB_OUTPUT"
+          # Extract the tag name (e.g., 'v1.0.0' from 'refs/tags/v1.0.0')
+          RAW_TAG="${GITHUB_REF##*/}"
+          # Remove any potential trailing colons or other problematic characters
+          CLEAN_TAG=$(echo "$RAW_TAG" | sed 's/:$//' | sed 's/\.$//' | sed 's/\-$//')
+          echo "Extracted RAW_TAG: $RAW_TAG"
+          echo "Cleaned TAG: $CLEAN_TAG"
+          echo "tag=$CLEAN_TAG" >> "$GITHUB_OUTPUT"
 
       - name: 🐋 Build and push Docker image
         uses: docker/build-push-action@v5
