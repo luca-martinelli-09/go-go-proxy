@@ -104,6 +104,18 @@ You can control allowed CORS origins using environment variables:
 
 The proxy uses this configuration in its CORS middleware to set the `Access-Control-Allow-Origin` header on all `/proxy` responses.
 
+### CORS Middleware Logging
+
+The CORS middleware emits detailed log messages at various stages to help diagnose origin-allow rules:
+
+- 🌐 `CORS start | Origin: <origin> | APIKeyName: <key>`: when CORS handling begins for a request.
+- 🔑 `CORS service-specific var ALLOWED_ORIGINS_<SERVICE>=<value>`: when a service-specific env var is read.
+- 🌍 `CORS global var ALLOWED_ORIGINS=<value>`: when falling back to the global origins list.
+- 🌍 `CORS fallback to wildcard '*'`: when defaulting to allow all origins.
+- ✅ `CORS allow all origins (*)`: when wildcard (`*`) is set.
+- ✅ `CORS origin allowed: <origin> (host <host>) in <list>`: when a specific origin matches the allowed list.
+- ⚠️ `CORS origin denied: <origin> not in allowed list <list>`: when a specific origin is not permitted.
+
 ## Usage
 
 ### 🐳 Run with Docker Hub Image
